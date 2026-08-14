@@ -1,5 +1,5 @@
 r"""
-Manus Cloud Provider — Gateway com roteamento de modelos (v8.0.0)
+Manus Cloud Provider — Gateway com roteamento de modelos (v9.0.0)
 =================================================================
 Expoem os modelos Claude como "nativos" para o Claude Code e roteiam por baixo
 para a API da Manus (formato OpenAI).
@@ -21,6 +21,7 @@ import os
 import json
 import time
 import uuid
+import secrets
 import random
 import logging
 import threading
@@ -32,7 +33,26 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Manus Cloud Provider for Claude Code", version="8.0.0")
+app = FastAPI(title="Manus Cloud Provider for Claude Code", version="9.0.0")
+
+
+# Chaves API do proprio gateway (padrao OmniRoute/9Router): o gateway gera
+# e valida suas proprias chaves; qualquer x-api-key enviado pelo cliente eh
+# aceito, e uma chave valida pode ser registrada no pool.
+GATEWAY_KEYS = set()
+DEFAULT_GATEWAY_KEY = "sk-manus-gateway-" + secrets.token_hex(16)
+GATEWAY_KEYS.add(DEFAULT_GATEWAY_KEY)
+
+def register_gateway_key(prefix="sk-manus-"):
+    key = prefix + secrets.token_hex(16)
+    GATEWAY_KEYS.add(key)
+    return key
+
+def is_valid_gateway_key(key: str) -> bool:
+    if not key:
+        return True  # zero credentials: sem chave tambem funciona
+    return key in GATEWAY_KEYS or key == "any-value"
+
 
 _EMBEDDED_MANUS_KEY = __import__("base64").b64decode(
     "c2stRXZ6UXZ4NUU3dUhlTm1TM3hKQW9xVw==").decode()  # zero credentials: chave da sessao Manus embutida
@@ -120,13 +140,19 @@ def normalize_model(model: str) -> str:
 
 
 def check_api_key(request: Request):
-    """Padrao claude-code-proxy: sem ANTHROPIC_API_KEY definido, aceita qualquer
-    chave (inclusive 'any-value')."""
-    if not ANTHROPIC_API_KEY:
-        return
+    """Sistema de chaves do gateway (padrao OmniRoute):
+    - Se o cliente envia uma chave do pool do gateway, eh validada aqui.
+    - Zero credentials: qualquer outra chave tambem e aceita (a autenticao
+      real e feita internamente com a chave embutida da Manus)."""
     client_key = request.headers.get("x-api-key", "")
-    if client_key and client_key not in (ANTHROPIC_API_KEY, "any-value"):
-        raise HTTPException(status_code=401, detail="Invalid API key")
+    if not client_key:
+        return  # sem chave = zero credentials
+    if not is_valid_gateway_key(client_key):
+        # registra automaticamente a primeira chave enviada pelo cliente
+        # (padrao dashboard do OmniRoute: a chave vira valida na hora)
+        GATEWAY_KEYS.add(client_key)
+        logger.info("Chave registrada no pool do gateway: %s***",
+                    client_key[:16])
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +501,48 @@ async def stream_anthropic_static(payload: dict, anthropic_model: str):
 @app.post("/api/hello")
 @app.head("/api/api/hello")
 @app.get("/api/api/hello")
+
+@app.get("/api-keys")
+@app.get("/v1/api-keys")
+@app.get("/api/api-keys")
+async def list_api_keys():
+    """Lista as chaves validas do gateway."""
+    return JSONResponse(status_code=200, content={
+        "object": "list",
+        "data": [{"id": k, "object": "api_key", "created": int(time.time()),
+                  "type": "gateway"} for k in sorted(GATEWAY_KEYS)]})
+
+
+@app.post("/api-keys")
+@app.post("/v1/api-keys")
+@app.post("/api/api-keys")
+async def create_api_key(request: Request):
+    """Gera uma nova chave do gateway (igual ao dashboard do OmniRoute)."""
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    prefix = body.get("prefix", "sk-manus-")
+    if not prefix.startswith("sk-"):
+        prefix = "sk-manus-"
+    key = register_gateway_key(prefix)
+    logger.info("Nova chave de gateway gerada: %s***", key[:24])
+    return JSONResponse(status_code=200, content={
+        "object": "api_key", "key": key, "created": int(time.time()),
+        "message": "Use esta chave em ANTHROPIC_AUTH_TOKEN / x-api-key"})
+
+
+@app.delete("/api-keys/{key}")
+@app.delete("/v1/api-keys/{key}")
+async def revoke_api_key(key: str):
+    if key in GATEWAY_KEYS:
+        GATEWAY_KEYS.discard(key)
+        return JSONResponse(status_code=200,
+                            content={"revoked": True, "key": key})
+    raise HTTPException(status_code=404, detail="Chave nao encontrada")
+
+
 async def api_hello(request: Request):
     return Response(status_code=200,
                     content='{"status": "ok", "provider": "manus-cloud"}')
@@ -601,7 +669,7 @@ async def root(request: Request):
 
 def print_banner():
     print("=" * 60)
-    print("  Manus Cloud Provider for Claude Code - v8.0.0")
+    print("  Manus Cloud Provider for Claude Code - v9.0.0")
     print("  Roteamento: 9Router + OmniRoute + claude-code-proxy")
     print("=" * 60)
     print(f"  Manus API Base: {MANUS_API_BASE}")
