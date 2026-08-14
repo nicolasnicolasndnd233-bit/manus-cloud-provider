@@ -663,7 +663,7 @@ async def openai_chat(request: Request):
 async def root(request: Request):
     return JSONResponse(status_code=200, content={
         "message": "Manus Cloud Provider for Claude Code running",
-        "version": "7.0.0",
+        "version": "9.0.0",
         "catalog": [m["id"] for m in CATALOG]})
 
 
@@ -677,6 +677,7 @@ def print_banner():
     print(f"  Middle Model (sonnet): {MIDDLE_MODEL}")
     print(f"  Small Model (haiku):   {SMALL_MODEL}")
     print(f"  RTK Token Saver: {'ON' if RTK_TOKEN_SAVER else 'OFF'}")
+    print(f"  Chave do gateway:   {DEFAULT_GATEWAY_KEY}")
     print(f"  Catalogo nativo: {[m['id'] for m in CATALOG]}")
     print("=" * 60)
 
