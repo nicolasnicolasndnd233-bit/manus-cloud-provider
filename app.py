@@ -1,5 +1,5 @@
 r"""
-Manus Cloud Provider — Gateway com roteamento de modelos (v9.0.0)
+Manus Cloud Provider — Gateway com roteamento de modelos (v10.0.0)
 =================================================================
 Expoem os modelos Claude como "nativos" para o Claude Code e roteiam por baixo
 para a API da Manus (formato OpenAI).
@@ -33,7 +33,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Manus Cloud Provider for Claude Code", version="9.0.0")
+app = FastAPI(title="Manus Cloud Provider for Claude Code", version="10.0.0")
 
 
 # Chaves API do proprio gateway (padrao OmniRoute/9Router): o gateway gera
@@ -73,6 +73,27 @@ MAX_RTK_CHARS = int(os.getenv("MAX_RTK_CHARS", "8000"))
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.INFO))
 logger = logging.getLogger("manus-proxy")
+
+# Heartbeat periodico (robustez v10): mantem a sessao Manus viva
+def _heartbeat_loop():
+    while True:
+        try:
+            time.sleep(300)
+            with httpx.Client(timeout=30) as c:
+                r = c.get(f"{MANUS_API_BASE}/models", headers={
+                    "Authorization": f"Bearer {get_manus_key()}"})
+                if r.status_code == 200:
+                    logger.info("Heartbeat: conexao Manus viva (%d modelos)",
+                                len((r.json() or {}).get("data", [])))
+                else:
+                    logger.warning("Heartbeat: status %d da Manus",
+                                   r.status_code)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Heartbeat: %s", e)
+
+threading.Thread(target=_heartbeat_loop, daemon=True, name="heartbeat").start()
+
+
 
 SSE_HEADERS = {
     "Cache-Control": "no-cache",
@@ -370,6 +391,25 @@ async def call_manus_with_fallback(payload: dict) -> httpx.Response:
                         headers={"Authorization": f"Bearer {get_manus_key()}",
                                  "Content-Type": "application/json"})
                 if last_resp.status_code == 200:
+                    # Robustez v10: a Manus as vezes responde 200 com um erro
+                    # embutido no JSON (ex: "Insufficient credits"). Se o
+                    # corpo contiver chave "error", trata como falha e tenta o
+                    # proximo modelo da cadeia antes de devolver ao cliente.
+                    try:
+                        _body = last_resp.json()
+                    except (json.JSONDecodeError, ValueError):
+                        _body = {}
+                    if isinstance(_body, dict) and _body.get("error") \
+                            and not (_body.get("choices") or []) \
+                            and not (_body.get("content") is not None and _body.get("type") == "message"):
+                        errors.append(f"200 com erro: "
+                                      f"{_body.get('error')} "
+                                      f"({attempt_model})")
+                        logger.warning("Resposta 200 com erro da Manus "
+                                       "(modelo %s): %s", attempt_model,
+                                       str(_body.get("error"))[:150])
+                        break  # troca de modelo nao ajuda em erro de conta;
+                        # sai e retorna a resposta real ao cliente
                     if attempt_model != requested:
                         logger.info("Fallback: %s -> %s", requested,
                                     attempt_model)
@@ -390,7 +430,12 @@ async def call_manus_with_fallback(payload: dict) -> httpx.Response:
                 errors.append(f"network error: {exc}")
                 if attempt < 2:
                     time.sleep(0.5 * (2 ** attempt))
+    # Robustez v10: devolve sempre a resposta real da Manus ao cliente
+    # (incluindo erros com mensagem legivel) em vez de silenciar.
     if last_resp is not None:
+        logger.warning("Todos os modelos da cadeia falharam (%s). "
+                       "Retornando resposta real da Manus.",
+                       "; ".join(errors[-2:]))
         return last_resp
     raise HTTPException(status_code=502, detail="; ".join(errors[-3:]))
 
@@ -493,7 +538,33 @@ async def stream_anthropic_static(payload: dict, anthropic_model: str):
 # ---------------------------------------------------------------------------
 # Health checks e coringa
 # ---------------------------------------------------------------------------
-@app.head("/v1/api/hello")
+# ROBUSTEZ (v10): excecoes globais - nenhum endpoint pode derrubar o gateway
+# ---------------------------------------------------------------------------
+@app.exception_handler(500)
+async def http_error_handler(request: Request, exc: Exception):
+    logger.error("Erro upstream (API Manus): %s", exc)
+    return JSONResponse(status_code=502, content={
+        "type": "error",
+        "error": {"type": "upstream_error", "message":
+                  "Gateway: a API externa esta indisponivel. Retrying..."}})
+
+
+@app.middleware("http")
+async def robustness_middleware(request: Request, call_next):
+    """Coracao (heartbeat): captura qualquer excessao restante e mantem
+    headers keep-alive para a conexao nunca cair."""
+    try:
+        response = await call_next(request)
+        response.headers["Connection"] = "keep-alive"
+        response.headers["X-Content-Keepalive"] = "manus-gateway"
+        return response
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Falha na rota %s: %s", request.url.path, e)
+        return JSONResponse(status_code=502, content={
+            "type": "error",
+            "error": {"type": "route_error", "message": str(e)[:200]}})
+
+
 @app.get("/v1/api/hello")
 @app.post("/v1/api/hello")
 @app.head("/api/hello")
@@ -663,13 +734,13 @@ async def openai_chat(request: Request):
 async def root(request: Request):
     return JSONResponse(status_code=200, content={
         "message": "Manus Cloud Provider for Claude Code running",
-        "version": "9.0.0",
+        "version": "10.0.0",
         "catalog": [m["id"] for m in CATALOG]})
 
 
 def print_banner():
     print("=" * 60)
-    print("  Manus Cloud Provider for Claude Code - v9.0.0")
+    print("  Manus Cloud Provider for Claude Code - v10.0.0")
     print("  Roteamento: 9Router + OmniRoute + claude-code-proxy")
     print("=" * 60)
     print(f"  Manus API Base: {MANUS_API_BASE}")
@@ -683,5 +754,75 @@ def print_banner():
 
 
 if __name__ == "__main__":
-    print_banner()
-    uvicorn.run(app, host="127.0.0.1", port=20128, log_level=LOG_LEVEL)
+    import argparse
+    _parser = argparse.ArgumentParser()
+    _parser.add_argument("--follow", "-f", action="store_true",
+                         help="Fixa o terminal no fim (auto-scroll dos logs)")
+    _args = _parser.parse_args()
+
+    if _args.follow:
+        _log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "gateway.log")
+        _fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        # Garante que TODOS os loggers gravam no mesmo arquivo compartilhado:
+        # root, modulo, uvicorn (request/response), fastapi, httpx...
+        _fh_root = logging.FileHandler(_log_file, mode="a", encoding="utf-8")
+        _fh_root.setFormatter(_fmt)
+        logging.getLogger().addHandler(_fh_root)
+        for _ln in ("uvicorn", "uvicorn.access", "uvicorn.error",
+                    "fastapi", "httpx", "manus-proxy", "watchdog"):
+            _l = logging.getLogger(_ln)
+            _l.propagate = True
+            _l.addHandler(_fh_root)
+        logger.info("Modo follow iniciado - logs gravados em gateway.log")
+        print(f"  Modo follow ativado (logs em {os.path.basename(_log_file)})")
+        print("  Terminal fixado no fim - pressione Ctrl+C para parar",
+              flush=True)
+        # Acompanhamento automatico estilo tail -f (logs sempre por baixo)
+        try:
+            with open(_log_file, "r", encoding="utf-8") as _lf:
+                _lf.seek(0, 2)
+                while True:
+                    _line = _lf.readline()
+                    if _line:
+                        print(_line.rstrip(), flush=True)
+                    else:
+                        time.sleep(0.1)
+        except KeyboardInterrupt:
+            pass
+        sys.exit(0)
+
+    # Logs persistentes: o servidor tambem grava em gateway.log, que o modo
+    # --follow le em tempo real (arquivo compartilhado).
+    _log_file_srv = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "gateway.log")
+    _fh_srv = logging.FileHandler(_log_file_srv, mode="a", encoding="utf-8")
+    _fh_srv.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    _root = logging.getLogger()
+    _root.addHandler(_fh_srv)
+    for _ln in ("uvicorn", "uvicorn.access", "uvicorn.error",
+                "fastapi", "httpx", "manus-proxy", "watchdog"):
+        logging.getLogger(_ln).addHandler(_fh_srv)
+
+    # Autorestart (robustez v10): se o servidor cair, levanta sozinho
+    _watchdog_start = time.time()
+
+    while True:
+        print_banner()
+        try:
+            uvicorn.run(app, host="127.0.0.1", port=20128,
+                        log_level=LOG_LEVEL,
+                        access_log=False)  # requests vao pro gateway.log
+        except SystemExit:
+            raise
+        except KeyboardInterrupt:
+            print("\n  Servidor parado pelo usuario. Ate logo!")
+            break
+        except Exception as e:  # noqa: BLE001
+            # crash inesperado: autorestart com espera crescente (max 10s)
+            crash_delay = min(10.0, time.time() - _watchdog_start + 1.0)
+            _watchdog_start = time.time()
+            print(f"\n  [WATCHDOG] Servidor caiu ({e}). Reiniciando em "
+                  f"{crash_delay:.0f}s...")
+            time.sleep(crash_delay)
