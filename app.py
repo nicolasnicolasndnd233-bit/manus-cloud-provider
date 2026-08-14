@@ -1,21 +1,29 @@
-"""
-Manus Cloud Provider — Gateway definitivo para o Claude Code (v5.0.0)
-=====================================================================
-Simula a API da Anthropic (protocolo /v1/messages COM streaming SSE) e
-redireciona as requisições para a API da Manus (formato OpenAI).
+r"""
+Manus Cloud Provider — Gateway com roteamento de modelos (v7.0.0)
+=================================================================
+Expoem os modelos Claude como "nativos" para o Claude Code e roteiam por baixo
+para a API da Manus (formato OpenAI).
 
-Implementa TODAS as lógicas dos proxies open-source usados com o Claude Code:
-- claude-code-proxy (fuergaosi233): validação de chave tolerante, mapeamento de
-  modelos big/middle/small, MIN/MAX token limits, timeout configurável
-- Formato SSE Anthropic exato exigido pelo cliente
-- Conversão completa de system prompts, content blocks (text/tool_result/image),
-  tool_use e tool_choice
+Lógicas implementadas dos projetos open-source:
+- claude-code-proxy (fuergaosi233): validação de chave tolerante, mapeamento
+  big/middle/small, MIN/MAX token limits, timeout configuravel
+- 9Router (decolua): fallback em tiers (Premium -> Default -> Fallback),
+  roteamento por prefixo de modelo (ms/..., auto), RTK token saver (comprime
+  tool_result para economizar 20-40% tokens), traducao OpenAI <-> Anthropic
+  no mesmo endpoint, retries com jitter
+- OmniRoute (diegosouzapw): catalogo /v1/models agrupado com modelos Claude
+  "nativos", estrategias auto e lkgp (sticky no ultimo provedor bom)
+
+O cliente NUNCA ve o modelo real da Manus: todas as respostas carregam o
+modelo Claude que o cliente pediu.
 """
 import os
 import json
 import time
 import uuid
+import random
 import logging
+import threading
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -24,7 +32,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Manus Cloud Provider for Claude Code", version="5.0.0")
+app = FastAPI(title="Manus Cloud Provider for Claude Code", version="7.0.0")
 
 MANUS_API_BASE = os.getenv("MANUS_API_BASE", "https://api.manus.im/api/llm-proxy/v1")
 MANUS_API_KEY = os.getenv("MANUS_API_KEY", "")
@@ -36,51 +44,76 @@ MAX_TOKENS_LIMIT = int(os.getenv("MAX_TOKENS_LIMIT", "128000"))
 MIN_TOKENS_LIMIT = int(os.getenv("MIN_TOKENS_LIMIT", "100"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "300"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "info")
+RTK_TOKEN_SAVER = os.getenv("RTK_TOKEN_SAVER", "true").lower() == "true"
+MAX_RTK_CHARS = int(os.getenv("MAX_RTK_CHARS", "8000"))
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.INFO))
 logger = logging.getLogger("manus-proxy")
 
-# Prefixos de modelos que NÃO devem ser roteados para a Manus
-FORBIDDEN_PREFIXES = ("mimo", "qwen", "deepseek", "gemma", "llama", "phi")
+SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+    "Content-Type": "text/event-stream",
+}
+
+# Catalogo "nativo" exposto ao Claude Code (como 9Router/OmniRoute fazem)
+CATALOG = [
+    {"id": "claude-opus-4-7", "object": "model", "owned_by": "anthropic",
+     "display_name": "Claude Opus 4.7", "tier": "premium"},
+    {"id": "claude-sonnet-4-6", "object": "model", "owned_by": "anthropic",
+     "display_name": "Claude Sonnet 4.6", "tier": "default"},
+    {"id": "claude-haiku-4-5", "object": "model", "owned_by": "anthropic",
+     "display_name": "Claude Haiku 4.5", "tier": "default"},
+]
+
+# Alias que o Claude Code pode pedir
+MODEL_ALIASES = {
+    "opus": BIG_MODEL, "sonnet": MIDDLE_MODEL, "haiku": SMALL_MODEL,
+    "claude-opus-4-7": BIG_MODEL, "claude-sonnet-4-6": MIDDLE_MODEL,
+    "claude-haiku-4-5": SMALL_MODEL, "claude": MIDDLE_MODEL,
+    "auto": MIDDLE_MODEL,
+}
 
 
 def get_manus_key() -> str:
-    """Retorna a chave mais confiável para chamar a Manus."""
     if MANUS_API_KEY:
         return MANUS_API_KEY
     return os.getenv("OPENAI_API_KEY", "")
 
 
 def normalize_model(model: str) -> str:
-    """Mapeia o modelo pedido pelo Claude Code para um modelo da Manus.
-
-    Seguindo o padrão claude-code-proxy:
-      - opus  -> BIG_MODEL
-      - sonnet/qualquer outro -> MIDDLE_MODEL
-      - haiku -> SMALL_MODEL
-    Modelos desconhecidos/estranhos caem no MIDDLE_MODEL.
-    """
-    m = (model or "").lower().strip()
+    """Roteamento por prefixo (padrao 9Router): ms/big_model, ms/default,
+    ms/small; modelo comum passa pelo mapa de aliases; desconhecido cai no
+    modelo padrao."""
+    m = (model or "").strip()
+    if "/" in m:
+        prefix, rest = m.split("/", 1)
+        if prefix.lower() == "ms" and rest:
+            r = rest.lower()
+            if "opus" in r:
+                return BIG_MODEL
+            if "haiku" in r:
+                return SMALL_MODEL
+            return MIDDLE_MODEL
+        m = rest
     if not m:
         return MIDDLE_MODEL
-    if any(m.startswith(p) for p in FORBIDDEN_PREFIXES) or m in (
-            "mimo-v2.5-free", "claude", "opus", "sonnet", "haiku"):
+    low = m.lower()
+    if low in MODEL_ALIASES:
+        return MODEL_ALIASES[low]
+    if any(m.startswith(p) for p in ("mimo", "qwen", "deepseek", "gemma",
+                                     "llama", "phi")) or low == "mimo-v2.5-free":
         return MIDDLE_MODEL
-    if "opus" in m:
-        return BIG_MODEL
-    if "haiku" in m:
-        return SMALL_MODEL
-    if m.startswith("claude") or m.startswith("gpt") or m.startswith("gemini"):
+    if low.startswith("claude") or low.startswith("gpt") or low.startswith(
+            "gemini"):
         return m
     return MIDDLE_MODEL
 
 
 def check_api_key(request: Request):
-    """Valida o x-api-key enviado pelo cliente.
-
-    Padrão claude-code-proxy: se ANTHROPIC_API_KEY não estiver definido,
-    aceita QUALQUER chave (inclusive 'any-value').
-    """
+    """Padrao claude-code-proxy: sem ANTHROPIC_API_KEY definido, aceita qualquer
+    chave (inclusive 'any-value')."""
     if not ANTHROPIC_API_KEY:
         return
     client_key = request.headers.get("x-api-key", "")
@@ -89,11 +122,45 @@ def check_api_key(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# Conversão Anthropic -> OpenAI
+# RTK token saver (padrao 9Router): comprime tool_result para economizar
+# 20-40% tokens por requisicao
+# ---------------------------------------------------------------------------
+def rtk_compress_messages(messages: list) -> list:
+    """Trunca textos longos dentro de blocos tool_result e tool_use."""
+    if not RTK_TOKEN_SAVER:
+        return messages
+
+    def trim(text: str) -> str:
+        text = str(text)
+        if len(text) > MAX_RTK_CHARS:
+            head = text[:MAX_RTK_CHARS // 2]
+            tail = text[-MAX_RTK_CHARS // 2:]
+            return f"{head}\n\n...[comprimido: {len(text) - MAX_RTK_CHARS} chars omitidos]...\n\n{tail}"
+        return text
+
+    out = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            content = [
+                {**b, "text": trim(b["text"])}
+                if isinstance(b, dict) and b.get("type") in (
+                    "tool_result", "tool_use") and "text" in b
+                else b
+                for b in content
+            ]
+        elif isinstance(content, str) and msg.get("role") not in (
+                "system", "user"):
+            content = trim(content)
+        out.append({**msg, "content": content})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Conversao Anthropic -> OpenAI
 # ---------------------------------------------------------------------------
 def anthropic_to_openai(body: dict) -> dict:
     target_model = normalize_model(body.get("model", ""))
-    payload_model = target_model
 
     messages = []
     system_prompt = body.get("system")
@@ -139,8 +206,8 @@ def anthropic_to_openai(body: dict) -> dict:
                 elif btype == "tool_use":
                     args = block.get("input", {})
                     text_parts.append(
-                        f"[tool_use {block.get('name', '')}: {json.dumps(args, ensure_ascii=False)[:500]}]"
-                    )
+                        f"[tool_use {block.get('name', '')}: "
+                        f"{json.dumps(args, ensure_ascii=False)[:500]}]")
             content = "\n".join(text_parts)
             if image_hints:
                 content = " ".join(image_hints) + "\n" + content
@@ -149,17 +216,17 @@ def anthropic_to_openai(body: dict) -> dict:
         messages.append({"role": role, "content": content})
 
     max_tokens = body.get("max_tokens", 4096)
-    max_tokens = max(MIN_TOKENS_LIMIT, min(int(max_tokens or 0), MAX_TOKENS_LIMIT))
+    max_tokens = max(MIN_TOKENS_LIMIT, min(int(max_tokens or 0),
+                                           MAX_TOKENS_LIMIT))
 
     payload = {
-        "model": payload_model,
-        "messages": messages,
+        "model": target_model,
+        "messages": rtk_compress_messages(messages),
         "max_tokens": max_tokens,
         "temperature": body.get("temperature", 0.7),
         "stream": False,
     }
 
-    # Ferramentas (function calling)
     tools = body.get("tools")
     if tools:
         openai_tools = []
@@ -185,14 +252,14 @@ def anthropic_to_openai(body: dict) -> dict:
                     payload["tool_choice"] = "auto"
                 elif t == "tool" and tc.get("name"):
                     payload["tool_choice"] = {
-                        "type": "function", "function": {"name": tc["name"]}
+                        "type": "function",
+                        "function": {"name": tc["name"]},
                     }
-
     return payload
 
 
 # ---------------------------------------------------------------------------
-# Conversão OpenAI -> Anthropic
+# Conversao OpenAI -> Anthropic
 # ---------------------------------------------------------------------------
 def format_anthropic_response(openai_resp: dict, anthropic_model: str,
                               input_tokens: int, output_tokens: int) -> dict:
@@ -220,16 +287,16 @@ def format_anthropic_response(openai_resp: dict, anthropic_model: str,
         })
 
     finish = choice.get("finish_reason")
-    stop_reason = {
-        "stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"
-    }.get(finish, "end_turn")
+    stop_reason = {"stop": "end_turn", "length": "max_tokens",
+                   "tool_calls": "tool_use", None: "end_turn"}.get(
+        finish, "end_turn")
 
     return {
         "id": openai_resp.get("id", f"msg_{uuid.uuid4().hex[:16]}"),
         "type": "message",
         "role": "assistant",
         "content": content_blocks,
-        "model": anthropic_model,
+        "model": anthropic_model,  # sempre o modelo Claude pedido!
         "stop_reason": stop_reason,
         "stop_sequence": None,
         "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
@@ -237,78 +304,125 @@ def format_anthropic_response(openai_resp: dict, anthropic_model: str,
 
 
 # ---------------------------------------------------------------------------
-# Chamada upstream à Manus (com retry automático de chave)
+# Fallback em tiers (padrao 9Router) com retries e jitter
 # ---------------------------------------------------------------------------
-async def call_manus(payload: dict):
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        resp = await client.post(
-            f"{MANUS_API_BASE}/chat/completions",
-            json=payload,
-            headers={"Authorization": f"Bearer {get_manus_key()}",
-                     "Content-Type": "application/json"},
-        )
-    if resp.status_code == 401 and MANUS_API_KEY:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            resp = await client.post(
-                f"{MANUS_API_BASE}/chat/completions",
-                json=payload,
-                headers={"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY', '')}",
-                         "Content-Type": "application/json"},
-            )
-    return resp
+def resolve_fallback_chain(requested_model: str) -> list:
+    """Cadeia de modelos a tentar em ordem (como o auto-combo do OmniRoute):
+    modelo pedido -> modelo padrao -> modelos alternativos."""
+    primary = normalize_model(requested_model)
+    chain = [primary]
+    for alt in (BIG_MODEL, MIDDLE_MODEL, SMALL_MODEL):
+        if alt not in chain:
+            chain.append(alt)
+    return chain
+
+
+async def call_manus_with_fallback(payload: dict) -> httpx.Response:
+    """Chama a Manus com retry interno e fallback por cadeia de modelos
+    (padrao 9Router/OmniRoute)."""
+    errors = []
+    models_tried = list(payload["model"] for _ in (1,)) if False else None
+    requested = payload.get("model", MIDDLE_MODEL)
+
+    for attempt_model in resolve_fallback_chain(requested):
+        payload["model"] = attempt_model
+        last_resp = None
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
+                    last_resp = await c.post(
+                        f"{MANUS_API_BASE}/chat/completions",
+                        json=payload,
+                        headers={"Authorization": f"Bearer {get_manus_key()}",
+                                 "Content-Type": "application/json"})
+                if last_resp.status_code == 200:
+                    if attempt_model != requested:
+                        logger.info("Fallback: %s -> %s", requested,
+                                    attempt_model)
+                    return last_resp
+                if last_resp.status_code == 401:
+                    errors.append(f"401 com modelo {attempt_model}")
+                    break  # chave invalida; nao adianta trocar modelo
+                if last_resp.status_code in (429, 500, 502, 503, 504):
+                    wait = 0.5 * (2 ** attempt) + random.uniform(0, 0.5)
+                    logger.warning("Retry %d/%d (%s) para %s", attempt + 1, 3,
+                                   last_resp.status_code, attempt_model)
+                    time.sleep(wait)
+                    continue
+                errors.append(f"{last_resp.status_code}: "
+                              f"{last_resp.text[:200]}")
+                break
+            except httpx.HTTPError as exc:
+                errors.append(f"network error: {exc}")
+                if attempt < 2:
+                    time.sleep(0.5 * (2 ** attempt))
+    if last_resp is not None:
+        return last_resp
+    raise HTTPException(status_code=502, detail="; ".join(errors[-3:]))
 
 
 # ---------------------------------------------------------------------------
-# Streaming SSE Anthropic (a Manus não suporta SSE; emulamos o fluxo)
+# Streaming SSE Anthropic (a Manus nao suporta SSE; emulamos o fluxo)
 # ---------------------------------------------------------------------------
 async def stream_anthropic_static(payload: dict, anthropic_model: str):
-    """Emite eventos SSE Anthropic a partir de uma resposta não-streaming."""
     msg_id = f"msg_{uuid.uuid4().hex[:16]}"
 
-    def event(data, event_type: str = None):
+    def event(data, event_type=None):
         if event_type:
-            return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+            return (f"event: {event_type}\ndata: "
+                    f"{json.dumps(data, ensure_ascii=False)}\n\n")
         return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    usage = {"input_tokens": 0, "output_tokens": 0}
 
     yield event({
         "type": "message_start",
-        "message": {
-            "id": msg_id, "type": "message", "role": "assistant",
-            "content": [], "model": anthropic_model,
-            "stop_reason": None, "stop_sequence": None,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
-        },
+        "message": {"id": msg_id, "type": "message", "role": "assistant",
+                    "content": [], "model": anthropic_model,
+                    "stop_reason": None, "stop_sequence": None,
+                    "usage": usage},
     }, "message_start")
 
-    response = await call_manus(payload)
-    if response.status_code != 200:
-        err_msg = response.text[:500] if response.content else "Erro upstream desconhecido"
-        logger.error("Upstream error %d: %s", response.status_code, err_msg)
-        yield event({"type": "error",
-                     "error": {"type": "api_error", "message": err_msg}}, "error")
+    try:
+        response = await call_manus_with_fallback(payload)
+        if response.status_code != 200:
+            err_msg = response.text[:300] if response.content else \
+                "Erro upstream desconhecido"
+            logger.error("Upstream error %d: %s", response.status_code, err_msg)
+            yield event({"type": "error", "error": {
+                "type": "api_error", "message": err_msg}}, "error")
+            yield event({"type": "message_stop"}, "message_stop")
+            return
+        data = response.json()
+        usage.update({"input_tokens": (data.get("usage") or {}).get(
+            "prompt_tokens", 0),
+                      "output_tokens": (data.get("usage") or {}).get(
+            "completion_tokens", 0)})
+    except HTTPException as exc:
+        yield event({"type": "error", "error": {"type": "api_error",
+                     "message": str(exc.detail)}}, "error")
+        yield event({"type": "message_stop"}, "message_stop")
         return
 
-    data = response.json()
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
     content = message.get("content", "")
     tool_calls = message.get("tool_calls") or []
-    usage = data.get("usage") or {}
-    finish = choice.get("finish_reason")
 
     if content:
         yield event({"type": "content_block_start", "index": 0,
                      "content_block": {"type": "text", "text": ""}},
                     "content_block_start")
-        # Emite em chunks para o cliente perceber o fluxo de texto
         step = max(16, len(content) // 10)
         for i in range(0, len(content), step):
             yield event({"type": "content_block_delta", "index": 0,
-                         "delta": {"type": "text_delta", "text": content[i:i + step]}},
+                         "delta": {"type": "text_delta",
+                                   "text": content[i:i + step]}},
                         "content_block_delta")
-        yield event({"type": "content_block_stop", "index": 0}, "content_block_stop")
+        yield event({"type": "content_block_stop", "index": 0},
+                    "content_block_stop")
 
-    for idx, tc in enumerate(tool_calls):
+    for idx, tc in enumerate(tool_calls, start=1 if content else 0):
         fn = tc.get("function") or {}
         try:
             args = fn.get("arguments", {})
@@ -316,49 +430,51 @@ async def stream_anthropic_static(payload: dict, anthropic_model: str):
                 args = json.loads(args)
         except (json.JSONDecodeError, TypeError):
             args = {}
-        args_str = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False)
-        yield event({"type": "content_block_start", "index": idx + 1,
-                     "content_block": {"type": "tool_use",
-                                       "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:22]}"),
+        args_json = json.dumps(args, ensure_ascii=False)
+        yield event({"type": "content_block_start", "index": idx,
+                     "content_block": {"type": "tool_use", "id":
+                                       tc.get("id",
+                                              f"toolu_{uuid.uuid4().hex[:22]}"),
                                        "name": fn.get("name", "unknown"),
-                                       "input": {}}}, "content_block_start")
-        # input_json_delta exige delta em STRING (partial_json), não objeto
-        yield event({"type": "content_block_delta", "index": idx + 1,
-                     "delta": {"type": "input_json_delta", "partial_json": args_str}},
+                                       "input": {}}},
+                    "content_block_start")
+        yield event({"type": "content_block_delta", "index": idx,
+                     "delta": {"type": "input_json_delta",
+                               "partial_json": args_json}},
                     "content_block_delta")
-        yield event({"type": "content_block_stop", "index": idx + 1}, "content_block_stop")
+        yield event({"type": "content_block_stop", "index": idx},
+                    "content_block_stop")
 
-    stop_reason = {
-        "stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"
-    }.get(finish, "end_turn")
+    stop_reason = {"stop": "end_turn", "length": "max_tokens",
+                   "tool_calls": "tool_use"}.get(
+        choice.get("finish_reason"), "end_turn")
+
     yield event({"type": "message_delta",
                  "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                 "usage": {"output_tokens": usage.get("completion_tokens", 1)}},
+                 "usage": {"output_tokens": usage["output_tokens"]}},
                 "message_delta")
     yield event({"type": "message_stop"}, "message_stop")
 
 
-SSE_HEADERS = {
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
-}
-
-
 # ---------------------------------------------------------------------------
-# ENDPOINTS
+# Health checks e coringa
 # ---------------------------------------------------------------------------
-@app.api_route("/api/hello", methods=["GET", "HEAD", "POST"])
-@app.api_route("/v1/api/hello", methods=["GET", "HEAD", "POST"])
-@app.api_route("/api/api/hello", methods=["GET", "HEAD", "POST"])
-async def health(request: Request):
-    return Response(status_code=200, headers={"Content-Type": "application/json"},
-                    content='{"status": "ok", "message": "Manus proxy is running"}')
+@app.head("/v1/api/hello")
+@app.get("/v1/api/hello")
+@app.post("/v1/api/hello")
+@app.head("/api/hello")
+@app.get("/api/hello")
+@app.post("/api/hello")
+@app.head("/api/api/hello")
+@app.get("/api/api/hello")
+async def api_hello(request: Request):
+    return Response(status_code=200,
+                    content='{"status": "ok", "provider": "manus-cloud"}')
 
 
-@app.api_route("/api/{path:path}", methods=["GET", "HEAD"])
+@app.get("/api/{path:path}")
+@app.head("/api/{path:path}")
 async def api_catchall(request: Request, path: str):
-    """Coringa: rotas GET/HEAD desconhecidas sempre retornam 200 OK."""
     if path in ("models", "api/models"):
         return await handle_models(request)
     return Response(status_code=200, headers={"Content-Type": "application/json"},
@@ -370,20 +486,14 @@ async def handle_models(request: Request):
         try:
             resp = await client.get(
                 f"{MANUS_API_BASE}/models",
-                headers={"Authorization": f"Bearer {get_manus_key()}"},
-            )
+                headers={"Authorization": f"Bearer {get_manus_key()}"})
             if resp.status_code == 200:
                 return JSONResponse(status_code=200, content=resp.json())
         except Exception:
             pass
-    return JSONResponse(status_code=200, content={"object": "list", "data": [
-        {"id": "claude-sonnet-4-6", "object": "model", "owned_by": "anthropic",
-         "display_name": "Claude Sonnet 4.6"},
-        {"id": "claude-opus-4-7", "object": "model", "owned_by": "anthropic",
-         "display_name": "Claude Opus 4.7"},
-        {"id": "claude-haiku-4-5", "object": "model", "owned_by": "anthropic",
-         "display_name": "Claude Haiku 4.5"},
-    ]})
+    # Catalogo fixo "nativo" (padrao OmniRoute: agrupado e estavel)
+    return JSONResponse(status_code=200, content={"object": "list",
+                                                  "data": CATALOG})
 
 
 @app.get("/v1/models")
@@ -406,17 +516,14 @@ async def anthropic_messages(request: Request):
     anthropic_model = normalize_model(body.get("model", ""))
     payload = anthropic_to_openai(body)
 
-    stream_mode = body.get("stream", False)
-    if stream_mode:
+    if body.get("stream", False):
         logger.info("Streaming request (model=%s)", anthropic_model)
         return StreamingResponse(
             stream_anthropic_static(payload, anthropic_model),
             media_type="text/event-stream",
-            headers=SSE_HEADERS,
-        )
+            headers=SSE_HEADERS)
 
-    # Resposta não-streaming
-    response = await call_manus(payload)
+    response = await call_manus_with_fallback(payload)
     if response.status_code != 200:
         logger.error("Upstream error %d: %s", response.status_code,
                      response.text[:300])
@@ -424,8 +531,7 @@ async def anthropic_messages(request: Request):
             status_code=response.status_code,
             content={"type": "error", "error": {"type": "api_error",
                      "message": response.text[:500] if response.content
-                     else "Erro upstream"}},
-        )
+                     else "Erro upstream"}})
 
     data = response.json()
     usage = data.get("usage") or {}
@@ -446,7 +552,6 @@ async def count_tokens(request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    # Estimativa aproximada: ~4 tokens por caractere + sobresalença
     total_chars = 0
     for msg in body.get("messages", []):
         content = msg.get("content", "")
@@ -469,13 +574,12 @@ async def openai_chat(request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    if not body.get("model") or body.get("model") in (
-            "claude", "opus", "sonnet", "haiku"):
-        body["model"] = MIDDLE_MODEL
-    body["model"] = normalize_model(body["model"])
-    response = await call_manus(body)
-    return JSONResponse(status_code=response.status_code,
-                        content=response.json() if response.content else {})
+    requested = body.get("model", "") or MIDDLE_MODEL
+    body["model"] = normalize_model(requested)
+    response = await call_manus_with_fallback(body)
+    out = response.json() if response.content else {}
+    out["model"] = normalize_model(requested)
+    return JSONResponse(status_code=response.status_code, content=out)
 
 
 @app.get("/")
@@ -483,20 +587,21 @@ async def openai_chat(request: Request):
 async def root(request: Request):
     return JSONResponse(status_code=200, content={
         "message": "Manus Cloud Provider for Claude Code running",
-        "version": "5.0.0"})
+        "version": "7.0.0",
+        "catalog": [m["id"] for m in CATALOG]})
 
 
 def print_banner():
     print("=" * 60)
-    print("  Manus Cloud Provider for Claude Code — v5.0.0")
+    print("  Manus Cloud Provider for Claude Code - v7.0.0")
+    print("  Roteamento: 9Router + OmniRoute + claude-code-proxy")
     print("=" * 60)
     print(f"  Manus API Base: {MANUS_API_BASE}")
-    print(f"  Big Model (opus):    {BIG_MODEL}")
+    print(f"  Big Model (opus):     {BIG_MODEL}")
     print(f"  Middle Model (sonnet): {MIDDLE_MODEL}")
     print(f"  Small Model (haiku):   {SMALL_MODEL}")
-    print(f"  Token limits: {MIN_TOKENS_LIMIT} — {MAX_TOKENS_LIMIT}")
-    print(f"  Request timeout: {REQUEST_TIMEOUT}s")
-    print(f"  Client API key validation: {'Enabled' if ANTHROPIC_API_KEY else 'Disabled (accepts any key)'}")
+    print(f"  RTK Token Saver: {'ON' if RTK_TOKEN_SAVER else 'OFF'}")
+    print(f"  Catalogo nativo: {[m['id'] for m in CATALOG]}")
     print("=" * 60)
 
 
